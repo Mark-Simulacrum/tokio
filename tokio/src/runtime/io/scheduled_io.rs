@@ -16,7 +16,6 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use std::task::{Context, Poll, Waker};
 
 /// Stored in the I/O driver resource slab.
-#[derive(Debug)]
 // # This struct should be cache padded to avoid false sharing. The cache padding rules are copied
 // from crossbeam-utils/src/cache_padded.rs
 //
@@ -104,7 +103,65 @@ pub(crate) struct ScheduledIo {
     /// Packs the resource's readiness and I/O driver latest tick.
     readiness: AtomicUsize,
 
+    start: std::time::Instant,
+    set_readiness_history: Mutex<
+        Vec<(
+            std::time::Duration,
+            (Tick, Option<usize>),
+            usize,
+            Option<usize>,
+        )>,
+    >,
+
     waiters: Mutex<Waiters>,
+}
+
+#[derive(Debug)]
+struct PackedReadiness {
+    tick: u16,
+    ready: Ready,
+    is_shutdown: bool,
+}
+
+impl PackedReadiness {
+    fn from_usize(v: usize) -> PackedReadiness {
+        PackedReadiness {
+            tick: TICK.unpack(v) as u16,
+            ready: Ready::from_usize(v),
+            is_shutdown: SHUTDOWN.unpack(v) != 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for ScheduledIo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let curr = self.readiness.load(Acquire);
+
+        f.debug_struct("ScheduledIo")
+            .field(
+                "thisptr",
+                &format_args!("{:p}", self as *const _ as *const ()),
+            )
+            .field("waiters", &self.waiters)
+            .field("readiness", &PackedReadiness::from_usize(curr))
+            .field(
+                "history",
+                &self
+                    .set_readiness_history
+                    .lock()
+                    .iter()
+                    .map(|(elapsed, tick, a, b)| {
+                        (
+                            elapsed,
+                            tick,
+                            PackedReadiness::from_usize(*a),
+                            b.map(PackedReadiness::from_usize),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 type WaitList = LinkedList<Waiter, <Waiter as linked_list::Link>::Target>;
@@ -169,7 +226,7 @@ enum State {
 
 const READINESS: bit::Pack = bit::Pack::least_significant(16);
 
-const TICK: bit::Pack = READINESS.then(8);
+const TICK: bit::Pack = READINESS.then(16);
 
 const SHUTDOWN: bit::Pack = TICK.then(1);
 
@@ -181,6 +238,8 @@ impl Default for ScheduledIo {
             linked_list_pointers: UnsafeCell::new(linked_list::Pointers::new()),
             readiness: AtomicUsize::new(0),
             waiters: Mutex::new(Waiters::default()),
+            start: std::time::Instant::now(),
+            set_readiness_history: Mutex::new(Default::default()),
         }
     }
 }
@@ -207,7 +266,12 @@ impl ScheduledIo {
     ///    specific tick.
     /// - `f`: a closure returning a new readiness value given the previous
     ///   readiness.
-    pub(super) fn set_readiness(&self, tick: Tick, f: impl Fn(Ready) -> Ready) {
+    pub(super) fn set_readiness(
+        &self,
+        tick: Tick,
+        generation: Option<usize>,
+        f: impl Fn(Ready) -> Ready,
+    ) {
         let mut current = self.readiness.load(Acquire);
 
         // If the io driver is shut down, then you are only allowed to clear readiness.
@@ -222,7 +286,13 @@ impl ScheduledIo {
             let next = match tick {
                 Tick::Set(t) => TICK.pack(t as usize, new.as_usize()),
                 Tick::Clear(t) => {
-                    if TICK.unpack(current) as u8 != t {
+                    if TICK.unpack(current) as u16 != t {
+                        self.set_readiness_history.lock().push((
+                            self.start.elapsed(),
+                            (tick, generation),
+                            current,
+                            None,
+                        ));
                         // Trying to clear readiness with an old event!
                         return;
                     }
@@ -235,7 +305,15 @@ impl ScheduledIo {
                 .readiness
                 .compare_exchange(current, next, AcqRel, Acquire)
             {
-                Ok(_) => return,
+                Ok(_) => {
+                    self.set_readiness_history.lock().push((
+                        self.start.elapsed(),
+                        (tick, generation),
+                        current,
+                        Some(next),
+                    ));
+                    return;
+                }
                 // we lost the race, retry!
                 Err(actual) => current = actual,
             }
@@ -308,7 +386,7 @@ impl ScheduledIo {
         let curr = self.readiness.load(Acquire);
 
         ReadyEvent {
-            tick: TICK.unpack(curr) as u8,
+            tick: TICK.unpack(curr) as u16,
             ready: interest.mask() & Ready::from_usize(READINESS.unpack(curr)),
             is_shutdown: SHUTDOWN.unpack(curr) != 0,
         }
@@ -357,7 +435,7 @@ impl ScheduledIo {
             let is_shutdown = SHUTDOWN.unpack(curr) != 0;
             if is_shutdown {
                 Poll::Ready(ReadyEvent {
-                    tick: TICK.unpack(curr) as u8,
+                    tick: TICK.unpack(curr) as u16,
                     ready: direction.mask(),
                     is_shutdown,
                 })
@@ -365,14 +443,14 @@ impl ScheduledIo {
                 Poll::Pending
             } else {
                 Poll::Ready(ReadyEvent {
-                    tick: TICK.unpack(curr) as u8,
+                    tick: TICK.unpack(curr) as u16,
                     ready,
                     is_shutdown,
                 })
             }
         } else {
             Poll::Ready(ReadyEvent {
-                tick: TICK.unpack(curr) as u8,
+                tick: TICK.unpack(curr) as u16,
                 ready,
                 is_shutdown,
             })
@@ -383,7 +461,7 @@ impl ScheduledIo {
         // This consumes the current readiness state **except** for closed
         // states. Closed states are excluded because they are final states.
         let mask_no_closed = event.ready - Ready::READ_CLOSED - Ready::WRITE_CLOSED;
-        self.set_readiness(Tick::Clear(event.tick), |curr| curr - mask_no_closed);
+        self.set_readiness(Tick::Clear(event.tick), None, |curr| curr - mask_no_closed);
     }
 
     pub(crate) fn clear_wakers(&self) {
@@ -471,7 +549,7 @@ impl Future for Readiness<'_> {
 
                     if !ready.is_empty() || is_shutdown {
                         // Currently ready!
-                        let tick = TICK.unpack(curr) as u8;
+                        let tick = TICK.unpack(curr) as u16;
                         *state = State::Done;
                         return Poll::Ready(ReadyEvent {
                             tick,
@@ -495,7 +573,7 @@ impl Future for Readiness<'_> {
 
                     if !ready.is_empty() || is_shutdown {
                         // Currently ready!
-                        let tick = TICK.unpack(curr) as u8;
+                        let tick = TICK.unpack(curr) as u16;
                         *state = State::Done;
                         return Poll::Ready(ReadyEvent {
                             tick,
@@ -559,7 +637,7 @@ impl Future for Readiness<'_> {
                     // The returned tick might be newer than the event
                     // which notified our waker. This is ok because the future
                     // still didn't return `Poll::Ready`.
-                    let tick = TICK.unpack(curr) as u8;
+                    let tick = TICK.unpack(curr) as u16;
 
                     // The readiness state could have been cleared in the meantime,
                     // but we allow the returned ready set to be empty.

@@ -20,7 +20,9 @@ use std::time::Duration;
 pub(crate) struct Driver {
     /// Tracks the number of times `turn` is called. It is safe for this to wrap
     /// as it is mostly used to determine when to call `compact()`.
-    tick: u8,
+    tick: u16,
+
+    tick_generations: usize,
 
     /// True when an event with the signal token is received
     signal_ready: bool,
@@ -53,7 +55,7 @@ pub(crate) struct Handle {
 
 #[derive(Debug)]
 pub(crate) struct ReadyEvent {
-    pub(super) tick: u8,
+    pub(super) tick: u16,
     pub(crate) ready: Ready,
     pub(super) is_shutdown: bool,
 }
@@ -76,9 +78,10 @@ pub(super) enum Direction {
     Write,
 }
 
+#[derive(Debug)]
 pub(super) enum Tick {
-    Set(u8),
-    Clear(u8),
+    Set(u16),
+    Clear(u16),
 }
 
 const TOKEN_WAKEUP: mio::Token = mio::Token(0);
@@ -103,6 +106,7 @@ impl Driver {
 
         let driver = Driver {
             tick: 0,
+            tick_generations: 0,
             signal_ready: false,
             events: mio::Events::with_capacity(nevents),
             poll,
@@ -145,6 +149,9 @@ impl Driver {
     fn turn(&mut self, handle: &Handle, max_wait: Option<Duration>) {
         debug_assert!(!handle.registrations.is_shutdown(&handle.synced.lock()));
 
+        if self.tick.checked_add(1).is_none() {
+            self.tick_generations += 1;
+        }
         self.tick = self.tick.wrapping_add(1);
 
         handle.release_pending_registrations();
@@ -184,7 +191,9 @@ impl Driver {
                 // an `Arc<ScheduledIo>` so we can safely cast this to a ref.
                 let io: &ScheduledIo = unsafe { &*ptr };
 
-                io.set_readiness(Tick::Set(self.tick), |curr| curr | ready);
+                io.set_readiness(Tick::Set(self.tick), Some(self.tick_generations), |curr| {
+                    curr | ready
+                });
                 io.wake(ready);
 
                 ready_count += 1;

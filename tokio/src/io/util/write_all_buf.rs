@@ -13,7 +13,7 @@ pin_project! {
     #[derive(Debug)]
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     pub struct WriteAllBuf<'a, W, B> {
-        writer: &'a mut W,
+        pub writer: &'a mut W,
         buf: &'a mut B,
         #[pin]
         _pin: PhantomPinned,

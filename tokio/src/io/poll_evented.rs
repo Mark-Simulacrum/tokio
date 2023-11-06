@@ -244,7 +244,10 @@ impl<E: Source> Deref for PollEvented<E> {
 
 impl<E: Source + fmt::Debug> fmt::Debug for PollEvented<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PollEvented").field("io", &self.io).finish()
+        f.debug_struct("PollEvented")
+            .field("io", &self.io)
+            .field("registration", &self.registration)
+            .finish()
     }
 }
 

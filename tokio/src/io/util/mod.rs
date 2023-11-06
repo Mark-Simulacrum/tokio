@@ -79,6 +79,7 @@ cfg_io_util! {
     mod write_all;
     mod write_buf;
     mod write_all_buf;
+    pub use write_all_buf::WriteAllBuf;
     mod write_int;
 
 

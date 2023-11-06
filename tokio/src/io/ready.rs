@@ -306,16 +306,30 @@ impl ops::Sub<Ready> for Ready {
 
 impl fmt::Debug for Ready {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut fmt = fmt.debug_struct("Ready");
+        let mut fmt = fmt.debug_set();
 
-        fmt.field("is_readable", &self.is_readable())
-            .field("is_writable", &self.is_writable())
-            .field("is_read_closed", &self.is_read_closed())
-            .field("is_write_closed", &self.is_write_closed())
-            .field("is_error", &self.is_error());
+        if self.is_readable() {
+            fmt.entry(&"readable");
+        }
+        if self.is_writable() {
+            fmt.entry(&"writable");
+        }
+        if self.is_read_closed() {
+            fmt.entry(&"read_closed");
+        }
+        if self.is_write_closed() {
+            fmt.entry(&"write_closed");
+        }
+        if self.is_error() {
+            fmt.entry(&"error");
+        }
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        fmt.field("is_priority", &self.is_priority());
+        {
+            if self.is_priority() {
+                fmt.entry(&"priority");
+            }
+        }
 
         fmt.finish()
     }
